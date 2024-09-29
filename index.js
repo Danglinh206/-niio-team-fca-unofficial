@@ -8,6 +8,7 @@ var checkVerified = null;
 
 var defaultLogRecordSize = 100;
 log.maxRecordSize = defaultLogRecordSize;
+global.ditconmemay = false;
 
 function setOptions(globalOptions, options) {
   Object.keys(options).map(function (key) {
@@ -76,7 +77,7 @@ function setOptions(globalOptions, options) {
   });
 }
 
-function buildAPI(globalOptions, html, jar) {
+function buildAPI(globalOptions, html, jar, bp_reg) {
   var maybeCookie = jar.getCookies("https://www.facebook.com").filter(function (val) {
     return val.cookieString().split("=")[0] === "c_user";
   });
@@ -85,7 +86,7 @@ function buildAPI(globalOptions, html, jar) {
 
   if (html.indexOf("/checkpoint/block/?next") > -1) log.warn("login", "Checkpoint detected. Please log in with a browser to verify.");
 
-  var userID = maybeCookie[0].cookieString().split("=")[1].toString();
+  var userID = Object.values(jar._jar.store.idx['facebook.com']['/']).map($ => $.toString()).join(';').match(/i_user=([^;]+);/)?.[1] || maybeCookie[0].cookieString().split("=")[1].toString();
   log.info("login", `Logged in as ${userID}`);
 
   try {
@@ -123,15 +124,23 @@ function buildAPI(globalOptions, html, jar) {
         log.warn("login", `Cannot get sequence ID with new RegExp. Fallback to old RegExp (without seqID)...`);
         log.info("login", `Got this account's message region: ${region}`);
         log.info("login", `[Unused] Polling endpoint: ${legacyFBMQTTMatch[6]}`);
+        if (legacyFBMQTTMatch.input.includes("601051028565049")) {
+          console.log(`lỗi login vì dính tài khoản tự động`);
+          ditconmemay = true;
+        }
       }
       else {
         log.warn("login", "Cannot get MQTT region & sequence ID.");
-        noMqttData = html;
+        if (bp_reg) {
+          log.info("login", `Đã bypass thành công region!`);
+        }
+        else {
+          noMqttData = html;
+        }
       }
     }
   }
 
-  // All data available to api functions
   var ctx = {
     userID: userID,
     jar: jar,
@@ -143,9 +152,11 @@ function buildAPI(globalOptions, html, jar) {
     mqttClient: undefined,
     lastSeqId: irisSeqID,
     syncToken: undefined,
-    mqttEndpoint,
-    region,
-    firstListen: true
+    mqttEndpoint: mqttEndpoint,
+    region: region,
+    firstListen: true,
+    req_ID: 0,
+    callback_Task: {}
   };
 
   var api = {
@@ -154,6 +165,7 @@ function buildAPI(globalOptions, html, jar) {
       return utils.getAppState(jar);
     }
   };
+
 
   if (noMqttData) api["htmlData"] = noMqttData;
 
@@ -213,9 +225,10 @@ function buildAPI(globalOptions, html, jar) {
   ];
 
   var defaultFuncs = utils.makeDefaults(html, userID, ctx);
-  api.postFormData = function(url, body) {
+  api.postFormData = function (url, body) {
     return defaultFuncs.postFormData(url, ctx.jar, body);
   };
+
   // Load all api functions in a loop
   apiFuncNames.map(v => api[v] = require('./src/' + v)(defaultFuncs, api, ctx));
 
@@ -452,25 +465,61 @@ function loginHelper(appState, email, password, globalOptions, callback, prCallb
   }
 
   var ctx = null;
-  var _defaultFuncs = null;
   var api = null;
+  let bp_reg = false;
+  let _defaultFuncs;
+
+  function bypass(res) {
+    bp_reg = true;
+    const _c = JSON.stringify(res.body).split('2Fhome.php&amp;gfid=')[1];
+    if (!_c) return res;
+    if (!_c || _c == "") return res;
+    const _f = _c.split("\\\\")[0].split(`\\`)[0]; // =)))
+    if (!_f || _f == '') return res;
+    const chuyển_đổi = "https://m.facebook.com/a/preferences.php?basic_site_devices=m_basic&uri=" + encodeURIComponent("https://m.facebook.com/home.php") + "&gfid=" + _f;
+    return utils.get(chuyển_đổi, jar, null, globalOptions).then(utils.saveCookies(jar));
+  }
+
 
   mainPromise = mainPromise
-    .then(function (res) {
-      // Hacky check for the redirection that happens on some ISPs, which doesn't return statusCode 3xx
-      var reg = /<meta http-equiv="refresh" content="0;url=([^"]+)[^>]+>/;
-      var redirect = reg.exec(res.body);
-      if (redirect && redirect[1]) return utils.get(redirect[1], jar, null, globalOptions).then(utils.saveCookies(jar));
+    .then(res => {
+      var redirectRegex = /<meta http-equiv="refresh" content="0;url=([^"]+)[^>]+>/;
+      var redirectMatch = redirectRegex.exec(res.body);
+      if (redirectMatch && redirectMatch[1]) {
+        return utils.get(redirectMatch[1], jar, null, globalOptions).then(utils.saveCookies(jar));
+      }
       return res;
     })
+    .then(res =>
+      bypass(res)
+    )
+
+    .then(function (res) {
+      let _r = /MPageLoadClientMetrics/gs;
+      if (!_r.test(res.body)) {
+        globalOptions.userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1";      /// nguồn horizon
+        return utils.get('https://www.facebook.com/', jar, null, globalOptions, { noRef: true }).then(utils.saveCookies(jar));
+      }
+      else return res;
+    })
+    .then(res => {
+      var redirectRegex = /<meta http-equiv="refresh" content="0;url=([^"]+)[^>]+>/;
+      var redirectMatch = redirectRegex.exec(res.body);
+      if (redirectMatch && redirectMatch[1]) {
+        return utils.get(redirectMatch[1], jar, null, globalOptions).then(utils.saveCookies(jar));
+      }
+      return res;
+    })
+    .then(res => bypass(res))
+
     .then(function (res) {
       var html = res.body;
-      var stuff = buildAPI(globalOptions, html, jar);
+      var stuff = buildAPI(globalOptions, html, jar, bp_reg);
       ctx = stuff[0];
       _defaultFuncs = stuff[1];
       api = stuff[2];
       return res;
-    });
+    })
 
   // given a pageID we log in as a page
   if (globalOptions.pageID) {
